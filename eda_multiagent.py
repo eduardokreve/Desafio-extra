@@ -49,6 +49,12 @@ from rich.console import Console
 from rich.table import Table
 from rich import box
 
+# Clustering
+from sklearn.preprocessing import StandardScaler
+from sklearn.decomposition import PCA
+from sklearn.cluster import KMeans
+from sklearn.metrics import silhouette_score
+
 # Importa LangChain/LangGraph apenas se disponível. Caso contrário, os
 # operadores relacionados ao modo chat não funcionarão.
 try:
@@ -586,6 +592,111 @@ def generate_conclusions() -> List[str]:
         save_memory(dataset_id_global, mem)  # type: ignore
     return bullets
 
+def compute_clusters(k: Optional[int] = None, auto: bool = True, max_k: int = 10) -> dict:
+    """
+    Executa K-Means sobre colunas numéricas (excluindo 'Time' e 'Class' por padrão),
+    com opção de escolher K automaticamente via silhouette.
+    Salva um scatter 2D (PCA) colorido por cluster em plots/<dataset_id>/cluster_pca_k<K>.png
+    e retorna um resumo com tamanhos, K escolhido, silhouette e variáveis que mais diferenciam os clusters.
+    """
+    ensure_dataset_loaded()
+    df = df_global  # type: ignore
+
+    # Seleciona apenas numéricas
+    num = df.select_dtypes(include=[np.number]).copy()
+    # Remover colunas que tendem a atrapalhar o agrupamento global
+    for drop_col in ("Time",):
+        if drop_col in num.columns:
+            num = num.drop(columns=[drop_col])
+    if num.shape[1] < 2 or len(num) < 2:
+        raise ValueError("Não há colunas numéricas suficientes para clusterização.")
+
+    # Trata NaN: median fill
+    num = num.fillna(num.median(numeric_only=True))
+
+    # Padroniza
+    scaler = StandardScaler()
+    X = scaler.fit_transform(num.values)
+
+    # Escolha de K
+    if auto or not k or k < 2:
+        best_k, best_score = None, -1.0
+        for kk in range(2, max(3, max_k) + 1):
+            km = KMeans(n_clusters=kk, random_state=42, n_init=10)
+            labels = km.fit_predict(X)
+            try:
+                sc = silhouette_score(X, labels)
+            except Exception:
+                sc = -1.0
+            if sc > best_score:
+                best_k, best_score = kk, sc
+        k_final, silhouette = int(best_k), float(best_score)
+    else:
+        k_final = int(k)
+        km_tmp = KMeans(n_clusters=k_final, random_state=42, n_init=10).fit(X)
+        labels = km_tmp.labels_
+        try:
+            silhouette = float(silhouette_score(X, labels))
+        except Exception:
+            silhouette = float("nan")
+
+    # Treina modelo final
+    km = KMeans(n_clusters=k_final, random_state=42, n_init=10)
+    labels = km.fit_predict(X)
+
+    # Tamanhos por cluster
+    uniq, cnts = np.unique(labels, return_counts=True)
+    sizes = {int(c): int(n) for c, n in zip(uniq, cnts)}
+
+    # Centroides em escala ORIGINAL (inverso do StandardScaler)
+    centroids_z = km.cluster_centers_
+    centroids = centroids_z * scaler.scale_[None, :] + scaler.mean_[None, :]
+    centroids_df = pd.DataFrame(centroids, columns=list(num.columns))
+    # Variáveis que mais diferenciam os clusters: desvio padrão entre centroides
+    var_diff = centroids_df.std(axis=0).sort_values(ascending=False)
+    top_features = [(col, float(val)) for col, val in var_diff.head(8).items()]
+
+    # (Opcional) cruzamento cluster x Class, se existir
+    class_crosstab = None
+    if "Class" in df.columns:
+        tmp = pd.DataFrame({"cluster": labels, "Class": df["Class"].values})
+        # normalizado por cluster (linha)
+        ct = pd.crosstab(tmp["cluster"], tmp["Class"], normalize="index").round(4)
+        class_crosstab = ct.to_dict(orient="index")
+
+    # PCA 2D para plot
+    pca = PCA(n_components=2, random_state=42)
+    XY = pca.fit_transform(X)
+    plt.figure()
+    plt.scatter(XY[:, 0], XY[:, 1], c=labels, s=8, alpha=0.7)
+    plt.title(f"K-Means (K={k_final}) – PCA 2D")
+    plt.xlabel("PC1")
+    plt.ylabel("PC2")
+    out = save_plot(dataset_id_global, f"cluster_pca_k{k_final}.png")  # type: ignore
+
+    # Atualiza memória
+    mem = mem_global  # type: ignore
+    mem.setdefault("plots", {})[f"cluster_pca_k{k_final}"] = out.as_posix()
+    mem["clusters"] = {
+        "k": k_final,
+        "silhouette": silhouette,
+        "sizes": sizes,
+        "plot": out.as_posix(),
+        "top_diff_features": top_features,
+        "class_crosstab": class_crosstab,
+    }
+    mem["updated_at"] = pd.Timestamp.utcnow().isoformat()
+    save_memory(dataset_id_global, mem)
+
+    return {
+        "k": k_final,
+        "silhouette": silhouette,
+        "sizes": sizes,
+        "plot": out.as_posix(),
+        "top_diff_features": top_features,
+        "class_crosstab": class_crosstab,
+    }
+
 
 # === Definições de tools para LangGraph ===
 if tool is not None:
@@ -729,6 +840,43 @@ if tool is not None:
             return "Ainda não há conclusões; execute algumas análises antes."
         return "\n".join([f"• {b}" for b in bullets])
 
+if tool is not None:
+    @tool
+    def cluster(k: str = "auto", max_k: int = 10) -> str:
+        """
+        Descobre agrupamentos (clusters) com K-Means.
+        - k="auto": escolhe K via silhouette (2..max_k).
+        - k=inteiro (>=2): usa o valor informado.
+        Gera PCA 2D colorido por cluster e salva em plots/<dataset_id>/cluster_pca_k<K>.png.
+        """
+        try:
+            if k != "auto":
+                try:
+                    k_int = int(k)
+                except Exception:
+                    return "Parâmetro k inválido. Use 'auto' ou um inteiro >= 2."
+                res = compute_clusters(k=k_int, auto=False, max_k=max_k)
+            else:
+                res = compute_clusters(k=None, auto=True, max_k=max_k)
+        except Exception as e:
+            return f"Erro no clustering: {e}"
+
+        lines = [
+            f"K escolhido: {res['k']}",
+            f"silhouette: {res['silhouette']:.4f}" if isinstance(res["silhouette"], float) else f"silhouette: {res['silhouette']}",
+            "tamanhos por cluster: " + ", ".join([f"C{c}={n}" for c, n in res["sizes"].items()]),
+            f"gráfico: {res['plot']}",
+        ]
+        if res["top_diff_features"]:
+            feats = "; ".join([f"{n} (σ_centroides={v:.4f})" for n, v in res["top_diff_features"]])
+            lines.append("variáveis que mais diferenciam os clusters: " + feats)
+        if res["class_crosstab"] is not None:
+            lines.append("cluster × Class (proporções por cluster):")
+            for c, row in res["class_crosstab"].items():
+                parts = ", ".join([f"{k}={v:.3f}" for k, v in row.items()])
+                lines.append(f"  C{c}: {parts}")
+        return "\n".join(lines)
+
 
 # === Função para construir o grafo (somente se dependências disponíveis) ===
 def get_graph():
@@ -746,6 +894,7 @@ def get_graph():
         bar_chart,
         frequencies,
         correlation,
+        cluster,
         scatter_plot,
         boxplot,
         trend,
@@ -942,6 +1091,36 @@ def memory_show() -> None:
     ensure_dataset_loaded()
     mem = mem_global  # type: ignore
     console.print_json(data=mem)
+
+@app.command()
+def cluster_cmd(
+    k: Optional[int] = typer.Option(None, "--k", help="Número de clusters. Se omitido, usa --auto"),
+    auto: bool = typer.Option(True, "--auto/--no-auto", help="Escolhe K via silhouette"),
+    max_k: int = typer.Option(10, "--max-k", help="K máximo ao usar --auto"),
+) -> None:
+    """Executa K-Means (com modo --auto) e salva PCA 2D por cluster."""
+    try:
+        res = compute_clusters(k=k, auto=auto, max_k=max_k)
+    except Exception as e:
+        console.print(f"[red]Erro:[/red] {e}")
+        return
+
+    console.print(f"[green]OK:[/green] K={res['k']} | silhouette={res['silhouette']}")
+    print_table([{"cluster": c, "tamanho": n} for c, n in res["sizes"].items()], title="Tamanhos por cluster")
+    if res["top_diff_features"]:
+        print_table(
+            [{"variável": n, "σ_centroides": f"{v:.6f}"} for n, v in res["top_diff_features"]],
+            title="Variáveis que mais diferenciam os clusters (desvio entre centroides)"
+        )
+    if res["class_crosstab"] is not None:
+        # Expõe a tabela cluster × Class como linhas
+        rows = []
+        for c, row in res["class_crosstab"].items():
+            r = {"cluster": c}
+            r.update({str(k): v for k, v in row.items()})
+            rows.append(r)
+        print_table(rows, title="Cluster × Class (proporções)")
+    console.print(f"Gráfico salvo em: [bold]{res['plot']}[/bold]")
 
 
 @app.command()

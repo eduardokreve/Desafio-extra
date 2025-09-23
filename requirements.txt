@@ -11,3 +11,6 @@ langchain>=0.2,<0.3
 langgraph>=0.3
 langchain-openai>=0.1
 openai>=1.40
+
+# Clustering
+scikit-learn>=1.3
