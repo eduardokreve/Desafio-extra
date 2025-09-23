@@ -1,0 +1,9 @@
+/version
+/eda_memory
+/plots
+/version
+/Arquivos
+/.eda_memory
+
+.DS_Store
+.eda_session.json

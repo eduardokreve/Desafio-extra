@@ -1,0 +1,13 @@
+# Core EDA / CLI
+pandas>=2.2
+numpy>=1.26
+matplotlib>=3.8
+rich>=13.7
+typer>=0.12
+duckdb>=1.0
+
+# Modo chat (LangGraph + LangChain 0.2+)
+langchain>=0.2,<0.3
+langgraph>=0.3
+langchain-openai>=0.1
+openai>=1.40
