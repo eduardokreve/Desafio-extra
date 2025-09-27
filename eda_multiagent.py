@@ -592,6 +592,78 @@ def generate_conclusions() -> List[str]:
         save_memory(dataset_id_global, mem)  # type: ignore
     return bullets
 
+def _norm_arg(normalize: Optional[str]):
+    if not normalize:
+        return False
+    n = str(normalize).strip().lower()
+    if n in {"index", "columns", "all"}:
+        return n
+    return False
+
+def compute_crosstab(
+    rows: str,
+    cols: str,
+    normalize: Optional[str] = None,
+    values: Optional[str] = None,
+    aggfunc: Optional[str] = None,
+    dropna: bool = False
+) -> tuple[pd.DataFrame, str]:
+    """
+    Calcula tabela cruzada (pd.crosstab). Gera e salva heatmap (PNG).
+    Retorna (DataFrame resultante, caminho_do_png).
+    """
+    ensure_dataset_loaded()
+    df = df_global  # type: ignore
+
+    if rows not in df.columns or cols not in df.columns:
+        raise ValueError("Colunas 'rows' ou 'cols' não encontradas no dataset.")
+
+    # validação de agregação
+    _agg = None
+    if values:
+        if values not in df.columns:
+            raise ValueError(f"Coluna de 'values' não encontrada: {values}")
+        if aggfunc:
+            agg_lower = str(aggfunc).lower()
+            if agg_lower not in {"sum", "mean", "count", "min", "max", "median"}:
+                raise ValueError("aggfunc inválido. Use: sum|mean|count|min|max|median")
+            _agg = agg_lower
+        else:
+            _agg = "count"
+
+    ct = pd.crosstab(
+        df[rows],
+        df[cols],
+        values=df[values] if values else None,
+        aggfunc=_agg,
+        normalize=_norm_arg(normalize),
+        dropna=dropna,
+    )
+
+    # Gera heatmap
+    plt.figure()
+    # Se todos NaN, substitui por 0 para plot
+    plot_df = ct.fillna(0)
+    im = plt.imshow(plot_df.values, aspect="auto", interpolation="nearest")
+    plt.colorbar(im)
+    plt.title(f"Crosstab: {rows} × {cols}" + (f" | norm={normalize}" if normalize else ""))
+    plt.xlabel(cols)
+    plt.ylabel(rows)
+    # ticks legíveis
+    plt.xticks(range(plot_df.shape[1]), [str(c) for c in plot_df.columns], rotation=45, ha="right")
+    plt.yticks(range(plot_df.shape[0]), [str(i) for i in plot_df.index])
+    fn = f"crosstab_{rows}_x_{cols}" + (f"_norm-{normalize}" if normalize else "")
+    out = save_plot(dataset_id_global, f"{fn}.png")  # type: ignore
+
+    # Atualiza memória
+    mem = mem_global  # type: ignore
+    mem.setdefault("plots", {})[fn] = out.as_posix()
+    mem["updated_at"] = pd.Timestamp.utcnow().isoformat()
+    save_memory(dataset_id_global, mem)
+
+    return ct, out.as_posix()
+
+
 def compute_clusters(k: Optional[int] = None, auto: bool = True, max_k: int = 10) -> dict:
     """
     Executa K-Means sobre colunas numéricas (excluindo 'Time' e 'Class' por padrão),
@@ -842,6 +914,47 @@ if tool is not None:
 
 if tool is not None:
     @tool
+    def crosstab_tool(
+        rows: str,
+        cols: str,
+        normalize: str = "",
+        values: str = "",
+        aggfunc: str = "",
+        dropna: bool = False
+    ) -> str:
+        """
+        Tabela cruzada (tabelas cruzadas) entre duas colunas.
+        Parâmetros:
+          - rows: coluna para linhas
+          - cols: coluna para colunas
+          - normalize: '', 'index', 'columns' ou 'all'
+          - values: (opcional) coluna numérica para agregação
+          - aggfunc: (opcional) sum|mean|count|min|max|median
+          - dropna: True para manter categorias NaN como rótulos
+        Gera e salva heatmap em plots/<dataset_id>/crosstab_*.png.
+        """
+        try:
+            nrm = normalize if normalize else None
+            vals = values if values else None
+            agg = aggfunc if aggfunc else None
+            ct, path = compute_crosstab(rows, cols, nrm, vals, agg, dropna)
+        except Exception as e:
+            return f"Erro na crosstab: {e}"
+
+        # monta resposta textual compacta
+        head = ct.head(10)  # corta para não explodir no chat
+        lines = ["Crosstab (amostra das primeiras linhas/colunas):"]
+        # formata manualmente uma pequena grade
+        col_names = [str(c) for c in head.columns]
+        lines.append("cols: " + ", ".join(col_names[:8]) + ("..." if len(col_names) > 8 else ""))
+        for idx, row in head.iterrows():
+            vals = ", ".join([str(row[c]) for c in head.columns[:8]])
+            lines.append(f"{idx}: {vals}" + (" ..." if len(col_names) > 8 else ""))
+        lines.append(f"Heatmap salvo em: {path}")
+        return "\n".join(lines)
+
+if tool is not None:
+    @tool
     def cluster(k: str = "auto", max_k: int = 10) -> str:
         """
         Descobre agrupamentos (clusters) com K-Means.
@@ -900,6 +1013,7 @@ def get_graph():
         trend,
         outliers,
         conclusions_tool,
+        crosstab_tool,
     ]
 
     api_key = os.environ.get("OPENAI_API_KEY")
@@ -1121,6 +1235,37 @@ def cluster_cmd(
             rows.append(r)
         print_table(rows, title="Cluster × Class (proporções)")
     console.print(f"Gráfico salvo em: [bold]{res['plot']}[/bold]")
+
+@app.command()
+def crosstab_cmd(
+    rows: str = typer.Option(..., "--rows", help="Coluna para as linhas"),
+    cols: str = typer.Option(..., "--cols", help="Coluna para as colunas"),
+    normalize: Optional[str] = typer.Option(None, "--normalize", help="index|columns|all"),
+    values: Optional[str] = typer.Option(None, "--values", help="Coluna numérica para agregação"),
+    aggfunc: Optional[str] = typer.Option(None, "--aggfunc", help="sum|mean|count|min|max|median"),
+    dropna: bool = typer.Option(False, "--dropna/--keepna", help="Tratar NaN como categoria")
+) -> None:
+    """Gera tabela cruzada entre duas colunas (e salva heatmap)."""
+    try:
+        ct, path = compute_crosstab(rows, cols, normalize, values, aggfunc, dropna)
+    except Exception as e:
+        console.print(f"[red]Erro:[/red] {e}")
+        return
+
+    # imprime tabela (limitada para caber no terminal)
+    df_show = ct.copy()
+    max_cols = 12
+    if df_show.shape[1] > max_cols:
+        df_show = df_show.iloc[:, :max_cols]
+    rows_out = []
+    for idx, row in df_show.iterrows():
+        d = {"__row__": str(idx)}
+        for c in df_show.columns:
+            d[str(c)] = row[c]
+        rows_out.append(d)
+    print_table(rows_out, title=f"Crosstab: {rows} × {cols}" + (f" | norm={normalize}" if normalize else ""))
+
+    console.print(f"[green]Heatmap salvo em:[/green] {path}")
 
 
 @app.command()
