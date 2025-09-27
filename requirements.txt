@@ -6,9 +6,13 @@ rich>=13.7
 typer>=0.12
 duckdb>=1.0
 
+# Compatibilidade (Pydantic v2)
+pydantic>=2.7,<3
+
 # Modo chat (LangGraph + LangChain 0.2+)
 langchain>=0.2,<0.3
-langgraph>=0.3
+langchain-core>=0.2,<0.3
+langgraph>=0.3,<0.4
 langchain-openai>=0.1
 openai>=1.40
 

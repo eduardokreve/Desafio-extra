@@ -59,12 +59,16 @@ from sklearn.metrics import silhouette_score
 # operadores relacionados ao modo chat não funcionarão.
 try:
     from langchain_core.tools import tool
+    from langchain_core.messages import HumanMessage
     from langchain_openai import ChatOpenAI
     from langgraph.prebuilt import create_react_agent
+    from langgraph.checkpoint.memory import MemorySaver
 except Exception:
     tool = None
+    HumanMessage = None
     ChatOpenAI = None
     create_react_agent = None
+    MemorySaver = None
 
 # === Configurações ===
 app = typer.Typer(add_completion=False, help="Agente E.D.A. multiagente para o terminal.")
@@ -991,41 +995,59 @@ if tool is not None:
         return "\n".join(lines)
 
 
-# === Função para construir o grafo (somente se dependências disponíveis) ===
+# === Função para construir o grafo (com memória via MemorySaver) ===
 def get_graph():
+    """
+    Constrói (ou retorna do cache) o grafo do agente com memória de conversa.
+    Usa MemorySaver como checkpointer. Retorna None se dependências não estiverem disponíveis.
+    """
     global graph_global
     if graph_global is not None:
         return graph_global
     if ChatOpenAI is None or create_react_agent is None:
         return None
 
+    # Garante dataset carregado (as tools dependem disso)
     ensure_dataset_loaded()
 
-    tools_list = [
-        describe_columns,
-        histogram,
-        bar_chart,
-        frequencies,
-        correlation,
-        cluster,
-        scatter_plot,
-        boxplot,
-        trend,
-        outliers,
-        conclusions_tool,
-        crosstab_tool,
+    # Monta a lista de tools presentes (evita NameError se alguma não existir)
+    tool_names = [
+        "describe_columns",
+        "histogram",
+        "bar_chart",
+        "frequencies",
+        "correlation",
+        "cluster",
+        "scatter_plot",
+        "boxplot",
+        "trend",
+        "outliers",
+        "conclusions_tool",
+        "crosstab_tool",
     ]
+    tools_list = [globals()[n] for n in tool_names if n in globals() and callable(globals()[n])]
 
+    # Chave de API (pede no terminal se não existir)
     api_key = os.environ.get("OPENAI_API_KEY")
     if not api_key:
         console.print("[yellow]Chave de API do OpenAI não encontrada. Ela é necessária para o modo chat.[/yellow]")
-        api_key = console.input("Digite sua OpenAI API key: ").strip()
+        try:
+            api_key = console.input("Digite sua OpenAI API key: ").strip()
+        except Exception:
+            api_key = input("Digite sua OpenAI API key: ").strip()
         os.environ["OPENAI_API_KEY"] = api_key
 
     llm = ChatOpenAI(model="gpt-4.1", temperature=0.0)
-    graph_global = create_react_agent(llm, tools_list)
-    return graph_global
 
+    # Checkpointer de memória (persistência em processo)
+    if MemorySaver is not None:
+        checkpointer = MemorySaver()
+        graph_global = create_react_agent(llm, tools_list, checkpointer=checkpointer)
+    else:
+        # fallback sem memória (conversa não persiste entre turns)
+        graph_global = create_react_agent(llm, tools_list)
+
+    return graph_global
 
 # === Comandos da CLI ===
 @app.command()
@@ -1271,20 +1293,28 @@ def crosstab_cmd(
 @app.command()
 def chat() -> None:
     """
-    Inicia um loop de conversa em linguagem natural usando LangGraph. O usuário
-    pode fazer perguntas arbitrárias sobre o dataset e o agente escolherá a
-    ferramenta adequada para respondê-las. Digite 'sair' ou 'exit' para encerrar.
+    Inicia um loop de conversa em linguagem natural usando LangGraph.
+    Mantém memória entre as mensagens via thread_id estável (por dataset).
+    Digite 'sair'/'exit'/'quit' para encerrar.
     """
     ensure_dataset_loaded()
     g = get_graph()
     if g is None:
         console.print(
-            "[red]Funcionalidade de chat indisponível. Instale langchain e langgraph e configure uma chave de API para usar este modo.[/red]"
+            "[red]Funcionalidade de chat indisponível. Instale langchain/langgraph e configure a OPENAI_API_KEY.[/red]"
         )
         raise typer.Exit(1)
+
+    # Um thread_id fixo por dataset garante memória de conversa por dataset
+    thread_id = f"cli-{dataset_id_global}"
+
+    # (Opcional) mostrar o modelo ativo se definido em variável de ambiente
+    model_name = os.getenv("OPENAI_MODEL", "gpt-4.1")
     console.print(
-        "[green]Modo chat iniciado. Pergunte algo sobre o dataset ou digite 'sair' para sair.[/green]"
+        f"[green]Modo chat iniciado (modelo: {model_name}). "
+        "Pergunte algo sobre o dataset ou digite 'sair' para sair.[/green]"
     )
+
     try:
         while True:
             try:
@@ -1292,36 +1322,41 @@ def chat() -> None:
             except (EOFError, KeyboardInterrupt):
                 console.print("\n[green]Chat encerrado.[/green]")
                 break
+
             if not prompt:
                 continue
             if prompt.lower() in {"sair", "exit", "quit"}:
                 console.print("[green]Chat encerrado.[/green]")
                 break
-            # Prepara a mensagem para o agente; `create_react_agent` espera dicionário
+
+            # Envia a mensagem mantendo o histórico via thread_id
             try:
-                result = g.invoke({"messages": [{"role": "user", "content": prompt}]})
+                result = g.invoke(
+                    {"messages": [HumanMessage(content=prompt)]},
+                    config={"configurable": {"thread_id": thread_id}},
+                )
             except Exception as e:
                 console.print(f"[red]Erro ao processar pergunta:[/red] {e}")
                 continue
-            # O retorno é um dicionário contendo as mensagens trocadas; exibimos a última
+
+            # Extrai a última mensagem de resposta do agente
             if isinstance(result, dict) and "messages" in result:
                 messages = result["messages"]
                 if messages:
                     last = messages[-1]
-                    # Mensagens do LangChain/LangGraph são objetos (AIMessage, etc.)
                     reply = getattr(last, "content", None)
                     if reply:
                         console.print(reply)
-                        # segue para próximo input do usuário
                         continue
-                    # Caso excepcional: se vier como dict
+                    # fallback se vier em formato dict
                     if isinstance(last, dict):
                         reply = last.get("content") or last.get("text")
                         if reply:
                             console.print(reply)
                             continue
-                        # fallback
-                        console.print(result)
+
+            # Fallback final (depuração)
+            console.print(str(result))
     finally:
         pass
 
