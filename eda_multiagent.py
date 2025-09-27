@@ -1022,7 +1022,7 @@ def get_graph():
         api_key = console.input("Digite sua OpenAI API key: ").strip()
         os.environ["OPENAI_API_KEY"] = api_key
 
-    llm = ChatOpenAI(model="gpt-4o-mini", temperature=0.0)
+    llm = ChatOpenAI(model="gpt-3.5-turbo", temperature=0.0)
     graph_global = create_react_agent(llm, tools_list)
     return graph_global
 
