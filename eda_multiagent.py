@@ -32,6 +32,9 @@ Exemplo de uso:
 
 """
 
+import io
+import traceback
+
 import json
 import hashlib
 import os
@@ -596,6 +599,131 @@ def generate_conclusions() -> List[str]:
         save_memory(dataset_id_global, mem)  # type: ignore
     return bullets
 
+# ---------- SQL (DuckDB) e Python REPL Tools ----------
+
+def _short_hash(s: str) -> str:
+    return hashlib.sha1(s.encode("utf-8")).hexdigest()[:10]
+
+def _format_table(df: pd.DataFrame, max_rows: int = 20, max_cols: int = 10) -> str:
+    if df.empty:
+        return "<resultado vazio>"
+    # limita colunas pra caber no terminal
+    if df.shape[1] > max_cols:
+        df = df.iloc[:, :max_cols]
+    # limita linhas
+    head = df.head(max_rows)
+    with pd.option_context("display.width", 120, "display.max_columns", max_cols):
+        return head.to_string(index=True)
+
+def _ensure_duckdb():
+    try:
+        import duckdb  # noqa: F401
+    except Exception as e:
+        raise RuntimeError("DuckDB não está instalado. Adicione 'duckdb' no requirements.") from e
+
+def _run_sql_internal(sql: str, limit: int = 1000) -> tuple[pd.DataFrame, str]:
+    """Executa SQL sobre o DataFrame atual (registrado como tabela 't') via DuckDB.
+       Retorna (DataFrame_resultado, caminho_csv_salvo)."""
+    ensure_dataset_loaded()
+    _ensure_duckdb()
+    import duckdb
+
+    con = duckdb.connect()
+    # registra o df do dataset como tabela 't'
+    con.register("t", df_global)  # df_global já está carregado
+
+    # aplica LIMIT se o usuário não colocou
+    if " limit " not in sql.lower() and not sql.strip().lower().endswith(" limit"):
+        sql_final = f"SELECT * FROM ({sql}) AS sub LIMIT {int(limit)}"
+    else:
+        sql_final = sql
+
+    res = con.execute(sql_final).df()
+
+    # salva resultado completo em CSV (nomeado pelo hash da query)
+    dsid = dataset_id_global or "dataset"
+    out_dir = ensure_plots_dir(dsid)
+    fname = f"sql_{_short_hash(sql)}.csv"
+    out_csv = (out_dir / fname).as_posix()
+    res.to_csv(out_csv, index=False)
+
+    # atualiza memória (opcional)
+    mem = mem_global
+    mem.setdefault("plots", {})[fname] = out_csv
+    mem["updated_at"] = pd.Timestamp.utcnow().isoformat()
+    save_memory(dsid, mem)
+
+    return res, out_csv
+
+
+def _python_exec_internal(code: str) -> str:
+    """Executa Python com builtins restritos e namespace controlado (df_global, pd, np, plt, save_plot)."""
+    ensure_dataset_loaded()
+
+    buf = io.StringIO()
+    def _safe_print(*args, **kwargs):
+        print(*args, file=buf, **kwargs)
+
+    # builtins permitidos
+    safe_builtins = {
+        "len": len, "range": range, "min": min, "max": max, "sum": sum,
+        "abs": abs, "round": round, "sorted": sorted, "enumerate": enumerate,
+        "zip": zip, "print": _safe_print,
+    }
+    # namespace disponível ao usuário
+    safe_globals = {"__builtins__": safe_builtins}
+    safe_locals = {
+        "pd": pd,
+        "np": np,
+        "df": df_global,  # DataFrame carregado
+        "plt": plt,
+        "dataset_id": dataset_id_global,
+        "save_plot": lambda filename: save_plot(dataset_id_global, filename),
+    }
+
+    try:
+        compiled = compile(code, "<python_tool>", "exec")
+        exec(compiled, safe_globals, safe_locals)
+        # Se o usuário definir 'result', mostramos também
+        if "result" in safe_locals:
+            _safe_print(repr(safe_locals["result"]))
+    except Exception:
+        tb = traceback.format_exc(limit=4)
+        return f"Erro ao executar código:\n{tb}"
+
+    out = buf.getvalue().strip()
+    return out or "OK (sem saída). Use print(...) ou atribua a `result` para ver o retorno."
+
+
+# ---- Tools expostas ao LangGraph ----
+if tool is not None:
+    @tool
+    def run_sql(sql: str, limit: int = 1000) -> str:
+        """
+        Executa uma consulta SQL (DuckDB) sobre a tabela 't' (o CSV carregado).
+        Ex.: SELECT Class, COUNT(*) FROM t GROUP BY 1 ORDER BY 2 DESC
+        Observações:
+          - Se não houver LIMIT na query, um LIMIT padrão é aplicado.
+          - Resultado completo é salvo como CSV em plots/<dataset_id>/sql_<hash>.csv.
+          - Retorna uma prévia tabular (máx. 20 linhas / 10 colunas) + caminho do CSV.
+        """
+        try:
+            df_res, path = _run_sql_internal(sql, limit)
+        except Exception as e:
+            return f"Erro no run_sql: {e}"
+        preview = _format_table(df_res)
+        return f"{preview}\n\nArquivo completo: {path}"
+
+    @tool
+    def python_exec(code: str) -> str:
+        """
+        Executa Python em um REPL restrito, com acesso a:
+          - df (DataFrame do dataset), pd, np, plt
+          - save_plot(filename) para salvar a figura atual em plots/<dataset_id>/
+        Dica: defina 'result = ...' ou use print(...) para ver saída.
+        """
+        return _python_exec_internal(code)
+
 def _norm_arg(normalize: Optional[str]):
     if not normalize:
         return False
@@ -1024,6 +1152,8 @@ def get_graph():
         "outliers",
         "conclusions_tool",
         "crosstab_tool",
+        "run_sql",
+        "python_exec"
     ]
     tools_list = [globals()[n] for n in tool_names if n in globals() and callable(globals()[n])]
 
@@ -1288,6 +1418,29 @@ def crosstab_cmd(
     print_table(rows_out, title=f"Crosstab: {rows} × {cols}" + (f" | norm={normalize}" if normalize else ""))
 
     console.print(f"[green]Heatmap salvo em:[/green] {path}")
+
+@app.command("sql")
+def sql_cmd(
+    query: str = typer.Argument(..., help="Consulta SQL sobre a tabela 't' (o CSV carregado)"),
+    limit: int = typer.Option(1000, "--limit", help="LIMIT padrão caso a query não tenha LIMIT")
+) -> None:
+    """Executa SQL via DuckDB e mostra uma prévia; salva CSV completo em plots/<dataset_id>/."""
+    try:
+        df_res, path = _run_sql_internal(query, limit)
+    except Exception as e:
+        console.print(f"[red]Erro:[/red] {e}")
+        return
+    console.print(_format_table(df_res))
+    console.print(f"[green]Arquivo completo:[/green] {path}")
+
+# --- WRAPPER CLI PARA PYTHON EXEC (usa seu helper interno) ---
+@app.command("py")
+def py_cmd(
+    code: str = typer.Argument(..., help='Código Python (ex.: "print(df.shape)")')
+) -> None:
+    """Executa Python restrito (df/pd/np/plt/save_plot)."""
+    out = _python_exec_internal(code)
+    console.print(out)
 
 
 @app.command()
